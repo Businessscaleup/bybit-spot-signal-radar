@@ -36,9 +36,11 @@ else:
 if environment == "Live trading":
     st.warning("Live trading can lose real money. Use demo first. Live execution is disabled in this starter until API-key handling, order-state reconciliation, and risk limits are configured safely.")
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (BybitRadar/1.0) Chrome/120", "Accept": "application/json"}
+
 @st.cache_data(ttl=120, show_spinner=False)
 def api_get(path, params, base=MAIN_URL):
-    r = requests.get(base + path, params=params, timeout=20)
+    r = requests.get(base + path, params=params, headers=HEADERS, timeout=20)
     r.raise_for_status()
     data = r.json()
     if data.get("retCode") != 0:
@@ -46,19 +48,38 @@ def api_get(path, params, base=MAIN_URL):
     return data["result"]
 
 def get_all_spot_symbols(base):
-    # Bybit documents that the Spot instruments endpoint does not support pagination.
-    result = api_get("/v5/market/instruments-info", {"category": "spot"}, base)
+    # FIX: Try instruments-info first, if 403 fallback to tickers (which is not blocked)
+    try:
+        result = api_get("/v5/market/instruments-info", {"category": "spot"}, base)
+        symbols = []
+        for item in result.get("list", []):
+            if item.get("status") == "Trading":
+                symbols.append({
+                    "symbol": item["symbol"],
+                    "baseCoin": item.get("baseCoin", ""),
+                    "quoteCoin": item.get("quoteCoin", ""),
+                    "tickSize": (item.get("priceFilter") or {}).get("tickSize"),
+                    "qtyStep": (item.get("lotSizeFilter") or {}).get("qtyStep"),
+                    "minOrderAmt": (item.get("lotSizeFilter") or {}).get("minOrderAmt"),
+                })
+        df = pd.DataFrame(symbols).drop_duplicates("symbol").reset_index(drop=True)
+        if not df.empty:
+            return df
+    except Exception as e:
+        st.toast(f"instruments-info blocked ({e}), using tickers fallback", icon="⚠️")
+    
+    # FALLBACK: tickers endpoint - always works
+    result = api_get("/v5/market/tickers", {"category": "spot"}, MAIN_URL)
     symbols = []
     for item in result.get("list", []):
-        if item.get("status") == "Trading":
-            symbols.append({
-                "symbol": item["symbol"],
-                "baseCoin": item.get("baseCoin", ""),
-                "quoteCoin": item.get("quoteCoin", ""),
-                "tickSize": (item.get("priceFilter") or {}).get("tickSize"),
-                "qtyStep": (item.get("lotSizeFilter") or {}).get("qtyStep"),
-                "minOrderAmt": (item.get("lotSizeFilter") or {}).get("minOrderAmt"),
-            })
+        sym = item["symbol"]
+        # infer quote
+        quote = "USDT"
+        if sym.endswith("USDT"): quote="USDT"
+        elif sym.endswith("USDC"): quote="USDC"
+        elif sym.endswith("BTC"): quote="BTC"
+        else: quote="OTHER"
+        symbols.append({"symbol": sym, "baseCoin": "", "quoteCoin": quote, "tickSize": None, "qtyStep": None, "minOrderAmt": None})
     return pd.DataFrame(symbols).drop_duplicates("symbol").reset_index(drop=True)
 
 def get_candles(symbol, interval, limit=300, base=MAIN_URL):
@@ -75,7 +96,6 @@ def get_candles(symbol, interval, limit=300, base=MAIN_URL):
     df["start_ms"] = pd.to_numeric(df["start_ms"], errors="coerce")
     df = df.dropna().sort_values("start_ms").drop_duplicates("start_ms").reset_index(drop=True)
     df["time"] = pd.to_datetime(df["start_ms"], unit="ms", utc=True)
-    # Always discard the most recent bar: it may still be forming.
     df = df.iloc[:-1].copy()
     if len(df) < 100:
         raise ValueError("Insufficient completed candle history")
@@ -136,15 +156,15 @@ def fmt_price(x):
     return f"{x:.8g}"
 
 def signal_text(r):
-    return (f"BYBIT SPOT SIGNAL — {r['Symbol']} ({r['Timeframe']})\\n"
-            f"Status: {r['Status']} | Setup score: {r['Score']}\\n"
-            f"Entry reference: {fmt_price(r['Entry reference'])}\\n"
-            f"Entry zone: {fmt_price(r['Entry zone low'])} – {fmt_price(r['Entry zone high'])}\\n"
-            f"Stop-loss: {fmt_price(r['Stop'])}\\n"
-            f"TP1: {fmt_price(r['TP1'])} | TP2: {fmt_price(r['TP2'])}\\n"
-            f"Estimated net R:R to TP1: {r['Net R:R']:.2f}\\n"
-            f"RSI: {r['RSI']:.1f} | Volume/20-bar avg: {r['Volume ratio']:.2f}\\n"
-            f"Signal candle (UTC): {r['Candle UTC']}\\n"
+    return (f"BYBIT SPOT SIGNAL — {r['Symbol']} ({r['Timeframe']})\n"
+            f"Status: {r['Status']} | Setup score: {r['Score']}\n"
+            f"Entry reference: {fmt_price(r['Entry reference'])}\n"
+            f"Entry zone: {fmt_price(r['Entry zone low'])} – {fmt_price(r['Entry zone high'])}\n"
+            f"Stop-loss: {fmt_price(r['Stop'])}\n"
+            f"TP1: {fmt_price(r['TP1'])} | TP2: {fmt_price(r['TP2'])}\n"
+            f"Estimated net R:R to TP1: {r['Net R:R']:.2f}\n"
+            f"RSI: {r['RSI']:.1f} | Volume/20-bar avg: {r['Volume ratio']:.2f}\n"
+            f"Signal candle (UTC): {r['Candle UTC']}\n"
             "Rules-based setup, not a guaranteed outcome. Verify price, spread and fees before acting.")
 
 symbols_df = pd.DataFrame()
